@@ -81,7 +81,7 @@ func TestTransportFor(t *testing.T) {
 	}
 	defer func() { _ = tp.Close() }()
 	network, _, port := tp.TransportFor(&Uri{Scheme: "sips", User: "a", Host: "h.com"})
-	if network != "tcp" || port != 5061 {
+	if network != "tls" || port != 5061 {
 		t.Fatal(network, port)
 	}
 	network, _, port = tp.TransportFor(&Uri{Scheme: "sip", User: "a", Host: "h.com", Params: NewParams().Set("transport", "tcp")})
@@ -89,7 +89,7 @@ func TestTransportFor(t *testing.T) {
 		t.Fatal(network, port)
 	}
 	network, _, _ = tp.TransportFor(&Uri{Scheme: "sip", Host: "h.com", Params: NewParams().Set("transport", "tls")})
-	if network != "tcp" {
+	if network != "tls" {
 		t.Fatal(network)
 	}
 	network, _, _ = tp.TransportFor(&Uri{Scheme: "sip", Host: "h.com", Params: NewParams().Set("transport", "udp")})

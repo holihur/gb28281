@@ -184,8 +184,8 @@ func TestInviteClientFlow(t *testing.T) {
 				t.Fatal(ev.Err)
 			}
 			if ev.Response.StatusCode == 180 {
-				if ctx.State() != TxStateProceeding {
-					t.Fatal(ctx.State())
+				if s := ctx.State(); s != TxStateProceeding && s != TxStateCompleted {
+					t.Fatal(s)
 				}
 			}
 			if ev.Response.StatusCode == 200 {

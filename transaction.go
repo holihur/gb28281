@@ -107,6 +107,8 @@ type TxManager struct {
 	cbMu sync.Mutex
 	txs  map[string]Transaction
 
+	Metrics *Metrics
+
 	OnRequest  func(req *Request, src Addr, stx *ServerTx)
 	OnResponse func(resp *Response, src Addr, ctx *ClientTx)
 	OnError    func(err error, src Addr)
@@ -217,6 +219,9 @@ func clientTxKey(req *Request) string {
 }
 
 func (m *TxManager) handlePacket(pkt *Packet) {
+	if m.Metrics != nil {
+		m.Metrics.Inc("packets_received")
+	}
 	switch msg := pkt.Msg.(type) {
 	case *Request:
 		m.handleRequest(msg, pkt.Src)
@@ -499,6 +504,17 @@ func (t *ClientTx) receive(resp *Response) {
 		t.mu.Unlock()
 		t.deliver(TxEvent{Response: resp})
 	case resp.StatusCode < 300:
+		if t.req.Method == INVITE {
+			wasCompleted := t.state == TxStateCompleted
+			t.setState(TxStateCompleted)
+			t.mu.Unlock()
+			if !wasCompleted {
+				t.deliver(TxEvent{Response: resp})
+				t.m.schedule(t.m.config().TimerD, t.finish)
+			}
+			t.sendACK(resp)
+			return
+		}
 		t.mu.Unlock()
 		t.deliver(TxEvent{Response: resp})
 		t.finish()
@@ -645,6 +661,11 @@ func (t *ServerTx) Respond(resp *Response) error {
 	}
 	if resp.Headers().Get("Call-ID") == nil {
 		resp.Headers().Set(NewHeader("Call-ID", t.req.CallID()))
+	}
+	if len(resp.Headers().All("Record-Route")) == 0 {
+		for _, rr := range t.req.Headers().All("Record-Route") {
+			resp.Headers().Add(rr.Clone())
+		}
 	}
 	t.mu.Lock()
 	switch {

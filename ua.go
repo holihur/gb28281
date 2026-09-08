@@ -172,6 +172,10 @@ func (ua *UA) handleBye(req *Request, stx *ServerTx) {
 		_ = stx.Respond(resp)
 		return
 	}
+	if cseq := req.CSeq(); cseq != nil && cseq.Seq < dlg.getRemoteSeq() {
+		_ = stx.Respond(NewResponse(500, ""))
+		return
+	}
 	dlg.Terminate()
 	ua.dialogs.Remove(dlg)
 	_ = stx.Respond(resp)
@@ -315,39 +319,41 @@ func (ua *UA) Invite(target *Uri, from *Address, contentType string, body []byte
 
 func (s *ClientInviteSession) pump() {
 	for {
-		select {
-		case ev := <-s.ctx.Events():
-			if ev.Err != nil {
-				s.mu.Lock()
-				s.Err = ev.Err
-				s.mu.Unlock()
-				close(s.Done)
-				return
-			}
-			resp := ev.Response
-			s.dlg.updateFromResponse(resp)
-			if resp.StatusCode >= 300 {
-				s.mu.Lock()
-				s.Final = resp
-				s.mu.Unlock()
-				s.dlg.Terminate()
-				s.ua.dialogs.Remove(s.dlg)
-				close(s.Done)
-				return
-			}
-			if resp.StatusCode >= 200 {
-				s.mu.Lock()
-				s.Final = resp
-				s.mu.Unlock()
-				s.dlg.SetState(DialogConfirmed)
-				s.dlg.RemoteTarget = contactUri(resp)
-				if s.dlg.RemoteTarget == nil && s.dlg.Remote != nil {
+		ev, ok := <-s.ctx.Events()
+		if !ok {
+			return
+		}
+		if ev.Err != nil {
+			s.mu.Lock()
+			s.Err = ev.Err
+			s.mu.Unlock()
+			close(s.Done)
+			return
+		}
+		resp := ev.Response
+		s.dlg.updateFromResponse(resp)
+		if resp.StatusCode >= 300 {
+			s.mu.Lock()
+			s.Final = resp
+			s.mu.Unlock()
+			s.dlg.Terminate()
+			s.ua.dialogs.Remove(s.dlg)
+			close(s.Done)
+			return
+		}
+		if resp.StatusCode >= 200 {
+			s.mu.Lock()
+			s.Final = resp
+			s.mu.Unlock()
+			s.dlg.SetState(DialogConfirmed)
+			if s.dlg.RemoteTarget == nil {
+				if cu := contactUri(resp); cu != nil {
+					s.dlg.RemoteTarget = cu
+				} else if s.dlg.Remote != nil {
 					s.dlg.RemoteTarget = s.dlg.Remote.Uri.Clone()
 				}
-				close(s.Done)
-				return
 			}
-		case <-s.ctx.Terminated():
+			close(s.Done)
 			return
 		}
 	}
@@ -395,17 +401,43 @@ func (s *ClientInviteSession) Ack() error {
 }
 
 // Hangup sends BYE on a dialog and waits for the final response.
+// A 491 (glare) response is retried with exponential backoff up to 2 times.
 func (ua *UA) Hangup(dlg *Dialog, timeout time.Duration) (*Response, error) {
-	req, err := dlg.CreateRequest(BYE, "", nil)
-	if err != nil {
-		return nil, err
+	backoff := 200 * time.Millisecond
+	var lastResp *Response
+	for attempt := 0; attempt < 3; attempt++ {
+		if attempt > 0 {
+			time.Sleep(backoff)
+			backoff *= 2
+		}
+		req, err := dlg.CreateRequest(BYE, "", nil)
+		if err != nil {
+			return nil, err
+		}
+		resp, err := ua.sendAndWait(req, dlg.RemoteTarget, timeout)
+		if err != nil {
+			return nil, err
+		}
+		if resp.StatusCode == 491 {
+			lastResp = resp
+			continue
+		}
+		dlg.Terminate()
+		return resp, nil
 	}
-	dst := Addr{Network: "udp", Host: dlg.RemoteTarget.Host, Port: dlg.RemoteTarget.EffectivePort()}
+	if lastResp != nil {
+		return lastResp, nil
+	}
+	return nil, ErrTimeout
+}
+
+func (ua *UA) sendAndWait(req *Request, target *Uri, timeout time.Duration) (*Response, error) {
+	network, host, port := ua.tp.TransportFor(target)
+	dst := Addr{Network: network, Host: host, Port: port}
 	ctx, err := ua.tm.Request(req, dst)
 	if err != nil {
 		return nil, err
 	}
-	defer dlg.Terminate()
 	deadline := time.After(timeout)
 	for {
 		select {

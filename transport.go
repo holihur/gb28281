@@ -1,6 +1,7 @@
 package sip
 
 import (
+	"crypto/tls"
 	"fmt"
 	"net"
 	"strconv"
@@ -35,19 +36,134 @@ type Packet struct {
 type Transport struct {
 	udpConn     *net.UDPConn
 	tcpListener *net.TCPListener
+	tlsListener net.Listener
+	tlsCfg      *tls.Config
+
+	dropHookMu     sync.Mutex
+	DropHook       func(msg Message, dst Addr) bool
+	TCPIdleTimeout time.Duration
+	MaxTCPConns    int
+
 	mu          sync.Mutex
 	tcpConns    map[string]net.Conn
+	connLastUse map[string]time.Time
 	packets     chan *Packet
 	done        chan struct{}
 	closeOnce   sync.Once
 }
 
+const (
+	defaultIdleTimeout = 5 * time.Minute
+	defaultMaxTCPConns = 1024
+	writeTimeout       = 10 * time.Second
+)
+
+func (t *Transport) dropHook() func(msg Message, dst Addr) bool {
+	t.dropHookMu.Lock()
+	defer t.dropHookMu.Unlock()
+	return t.DropHook
+}
+
+func (t *Transport) SetDropHook(f func(msg Message, dst Addr) bool) {
+	t.dropHookMu.Lock()
+	t.DropHook = f
+	t.dropHookMu.Unlock()
+}
+
+func (t *Transport) idleTimeout() time.Duration {
+	t.dropHookMu.Lock()
+	defer t.dropHookMu.Unlock()
+	if t.TCPIdleTimeout > 0 {
+		return t.TCPIdleTimeout
+	}
+	return defaultIdleTimeout
+}
+
+func (t *Transport) maxTCPConns() int {
+	t.dropHookMu.Lock()
+	defer t.dropHookMu.Unlock()
+	if t.MaxTCPConns > 0 {
+		return t.MaxTCPConns
+	}
+	return defaultMaxTCPConns
+}
+
+func (t *Transport) touchConn(key string) {
+	t.mu.Lock()
+	if t.connLastUse != nil {
+		t.connLastUse[key] = time.Now()
+	}
+	t.mu.Unlock()
+}
+
+func (t *Transport) dropConn(key string) {
+	t.mu.Lock()
+	if c, ok := t.tcpConns[key]; ok {
+		_ = c.Close()
+		delete(t.tcpConns, key)
+		delete(t.connLastUse, key)
+	}
+	t.mu.Unlock()
+}
+
+func NewTLSTransport(host string, udpPort, tcpPort, tlsPort int, cfg *tls.Config) (*Transport, error) {
+	t, err := NewTransport(host, udpPort, tcpPort)
+	if err != nil {
+		return nil, err
+	}
+	if cfg == nil {
+		return nil, fmt.Errorf("sip: tls requires a config")
+	}
+	t.tlsCfg = cfg
+	if tlsPort >= 0 {
+		addr := &net.TCPAddr{IP: net.ParseIP(host), Port: tlsPort}
+		if addr.IP == nil {
+			addr = &net.TCPAddr{Port: tlsPort}
+		}
+		l, err := net.ListenTCP("tcp", addr)
+		if err != nil {
+			_ = t.Close()
+			return nil, fmt.Errorf("sip: tls listen: %w", err)
+		}
+		t.tlsListener = tls.NewListener(l, cfg)
+		go t.acceptStream(t.tlsListener, "tls")
+	}
+	go t.janitor()
+	return t, nil
+}
+
+func (t *Transport) janitor() {
+	ticker := time.NewTicker(250 * time.Millisecond)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-t.done:
+			return
+		case <-ticker.C:
+			t.mu.Lock()
+			now := time.Now()
+			for key, last := range t.connLastUse {
+				if now.Sub(last) > t.idleTimeout() {
+					if c, ok := t.tcpConns[key]; ok {
+						_ = c.Close()
+					}
+					delete(t.tcpConns, key)
+					delete(t.connLastUse, key)
+				}
+			}
+			t.mu.Unlock()
+		}
+	}
+}
+
 func NewTransport(host string, udpPort, tcpPort int) (*Transport, error) {
 	t := &Transport{
-		tcpConns: make(map[string]net.Conn),
-		packets:  make(chan *Packet, 256),
-		done:     make(chan struct{}),
+		tcpConns:    make(map[string]net.Conn),
+		connLastUse: make(map[string]time.Time),
+		packets:     make(chan *Packet, 256),
+		done:        make(chan struct{}),
 	}
+	go t.janitor()
 	if udpPort >= 0 {
 		addr := &net.UDPAddr{IP: net.ParseIP(host), Port: udpPort}
 		if addr.IP == nil {
@@ -71,7 +187,7 @@ func NewTransport(host string, udpPort, tcpPort int) (*Transport, error) {
 			return nil, fmt.Errorf("sip: tcp listen: %w", err)
 		}
 		t.tcpListener = l
-		go t.acceptTCP()
+		go t.acceptStream(l, "tcp")
 	}
 	return t, nil
 }
@@ -108,9 +224,9 @@ func (t *Transport) readUDP() {
 	}
 }
 
-func (t *Transport) acceptTCP() {
+func (t *Transport) acceptStream(l net.Listener, network string) {
 	for {
-		c, err := t.tcpListener.Accept()
+		c, err := l.Accept()
 		if err != nil {
 			select {
 			case <-t.done:
@@ -119,18 +235,36 @@ func (t *Transport) acceptTCP() {
 				continue
 			}
 		}
+		t.mu.Lock()
+		n := len(t.tcpConns)
+		t.mu.Unlock()
+		if n > t.maxTCPConns() {
+			_ = c.Close()
+			continue
+		}
 		go t.readTCP(c)
 	}
 }
 
 func (t *Transport) readTCP(c net.Conn) {
-	defer func() { _ = c.Close() }()
+	defer func() {
+		t.dropConn(t.connKey(c))
+		_ = c.Close()
+	}()
 	t.mu.Lock()
-	t.tcpConns[AddrFromTCP(c.RemoteAddr().(*net.TCPAddr)).String()] = c
+	t.tcpConns[t.connKey(c)] = c
+	if t.connLastUse != nil {
+		t.connLastUse[t.connKey(c)] = time.Now()
+	}
 	t.mu.Unlock()
 	splitter := &StreamSplitter{}
 	buf := make([]byte, 65535)
+	network := "tcp"
+	if _, ok := c.(*tls.Conn); ok {
+		network = "tls"
+	}
 	src := AddrFromTCP(c.RemoteAddr().(*net.TCPAddr))
+	src.Network = network
 	for {
 		n, err := c.Read(buf)
 		if n > 0 {
@@ -170,6 +304,9 @@ func (t *Transport) Send(network string, dst Addr, msg Message) error {
 		if t.udpConn == nil {
 			return fmt.Errorf("%w: udp not enabled", ErrTransportClosed)
 		}
+		if hook := t.dropHook(); hook != nil && hook(msg, dst) {
+			return nil
+		}
 		addr := &net.UDPAddr{IP: net.ParseIP(dst.Host), Port: dst.Port}
 		if addr.IP == nil {
 			ips, err := net.LookupIP(dst.Host)
@@ -178,13 +315,16 @@ func (t *Transport) Send(network string, dst Addr, msg Message) error {
 			}
 			addr.IP = ips[0]
 		}
+		_ = t.udpConn.SetWriteDeadline(time.Now().Add(writeTimeout))
 		_, err := t.udpConn.WriteToUDP(data, addr)
 		return err
-	case "tcp":
-		conn, err := t.getTCPConn(dst)
+	case "tcp", "tls":
+		conn, err := t.getStreamConn(network, dst)
 		if err != nil {
 			return err
 		}
+		_ = conn.SetWriteDeadline(time.Now().Add(writeTimeout))
+		t.touchConn(t.connKey(conn))
 		_, err = conn.Write(data)
 		return err
 	default:
@@ -192,24 +332,56 @@ func (t *Transport) Send(network string, dst Addr, msg Message) error {
 	}
 }
 
-func (t *Transport) getTCPConn(dst Addr) (net.Conn, error) {
+func (t *Transport) connKey(c net.Conn) string {
+	network := "tcp"
+	if _, ok := c.(*tls.Conn); ok {
+		network = "tls"
+	}
+	return Addr{Network: network, Host: c.RemoteAddr().(*net.TCPAddr).IP.String(), Port: c.RemoteAddr().(*net.TCPAddr).Port}.String()
+}
+
+func (t *Transport) getStreamConn(network string, dst Addr) (net.Conn, error) {
 	key := dst.String()
 	t.mu.Lock()
 	if c, ok := t.tcpConns[key]; ok {
 		t.mu.Unlock()
 		return c, nil
 	}
+	if len(t.tcpConns) >= t.maxTCPConns() {
+		t.mu.Unlock()
+		return nil, fmt.Errorf("%w: too many connections", ErrTransportClosed)
+	}
 	t.mu.Unlock()
 	d := net.Dialer{Timeout: 5 * time.Second}
-	c, err := d.Dial("tcp", net.JoinHostPort(dst.Host, strconv.Itoa(dst.Port)))
+	var c net.Conn
+	var err error
+	if network == "tls" {
+		cfg := t.tlsCfg.Clone()
+		if cfg.ServerName == "" {
+			cfg.ServerName = dst.Host
+		}
+		c, err = tls.DialWithDialer(&d, "tcp", formatHostPort(HostPort{dst.Host, dst.Port}), cfg)
+	} else {
+		c, err = d.Dial("tcp", net.JoinHostPort(dst.Host, strconv.Itoa(dst.Port)))
+	}
 	if err != nil {
 		return nil, err
 	}
 	t.mu.Lock()
 	t.tcpConns[key] = c
+	if t.connLastUse != nil {
+		t.connLastUse[key] = time.Now()
+	}
 	t.mu.Unlock()
 	go t.readTCP(c)
 	return c, nil
+}
+
+func (t *Transport) TLSPort() int {
+	if t.tlsListener == nil {
+		return 0
+	}
+	return t.tlsListener.Addr().(*net.TCPAddr).Port
 }
 
 func (t *Transport) Close() error {
@@ -221,6 +393,9 @@ func (t *Transport) Close() error {
 		}
 		if t.tcpListener != nil {
 			_ = t.tcpListener.Close()
+		}
+		if t.tlsListener != nil {
+			_ = t.tlsListener.Close()
 		}
 		t.mu.Lock()
 		for _, c := range t.tcpConns {
@@ -236,14 +411,14 @@ func (t *Transport) Close() error {
 func (t *Transport) TransportFor(uri *Uri) (network string, host string, port int) {
 	network = "udp"
 	if uri.IsEncrypted() {
-		network = "tcp"
+		network = "tls"
 	}
 	if tp, ok := uri.Params.Get("transport"); ok {
 		switch strings.ToLower(tp) {
 		case "tcp":
 			network = "tcp"
 		case "tls":
-			network = "tcp"
+			network = "tls"
 		case "udp":
 			network = "udp"
 		}

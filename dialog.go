@@ -158,6 +158,12 @@ func recordRouteSet(m Message) []*Uri {
 	return set
 }
 
+func (d *Dialog) getRemoteSeq() uint32 {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	return d.RemoteSeq
+}
+
 func (d *Dialog) updateFromRequest(req *Request) {
 	d.mu.Lock()
 	defer d.mu.Unlock()
