@@ -6,7 +6,7 @@ import (
 	"os"
 	"os/signal"
 
-	"github.com/jingdor/sip"
+	"github.com/holihur/sip"
 )
 
 func main() {
