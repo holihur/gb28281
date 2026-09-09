@@ -2,7 +2,11 @@ package sip
 
 import (
 	"crypto/md5"
+	"crypto/sha256"
+	"crypto/sha512"
+	"encoding/hex"
 	"fmt"
+	"strings"
 	"sync"
 	"time"
 )
@@ -104,7 +108,7 @@ func (ua *UA) handleRequest(req *Request, src Addr, stx *ServerTx) {
 	case ACK, CANCEL:
 		return
 	case BYE:
-		ua.handleBye(req, stx)
+		ua.handleBye(req, src, stx)
 		return
 	case INVITE:
 		ua.handleInvite(req, stx)
@@ -164,12 +168,16 @@ func (ua *UA) findDialog(req *Request) *Dialog {
 	return d
 }
 
-func (ua *UA) handleBye(req *Request, stx *ServerTx) {
+func (ua *UA) handleBye(req *Request, src Addr, stx *ServerTx) {
 	dlg := ua.findDialog(req)
 	resp := NewResponse(200, "")
 	if dlg == nil {
 		resp = NewResponse(481, "")
 		_ = stx.Respond(resp)
+		return
+	}
+	if !dialogSourceAllowed(dlg, src) {
+		_ = stx.Respond(NewResponse(403, ""))
 		return
 	}
 	if cseq := req.CSeq(); cseq != nil && cseq.Seq < dlg.getRemoteSeq() {
@@ -182,6 +190,24 @@ func (ua *UA) handleBye(req *Request, stx *ServerTx) {
 	if cb := ua.callbacks(); cb.OnBye != nil {
 		cb.OnBye(req, dlg, stx)
 	}
+}
+
+// dialogSourceAllowed verifies an in-dialog request came from the dialog's
+// remote endpoint, defending against spoofed BYE/CANCEL.
+func dialogSourceAllowed(dlg *Dialog, src Addr) bool {
+	if dlg == nil {
+		return false
+	}
+	host := ""
+	if dlg.RemoteTarget != nil {
+		host = dlg.RemoteTarget.Host
+	} else if dlg.Remote != nil && dlg.Remote.Uri != nil {
+		host = dlg.Remote.Uri.Host
+	}
+	if host == "" {
+		return true
+	}
+	return sameHost(src.Host, host)
 }
 
 func (ua *UA) handleInvite(req *Request, stx *ServerTx) {
@@ -223,7 +249,14 @@ func (ua *UA) Register(aor *Uri, contact *Uri, expires int, creds *Credentials) 
 func (ua *UA) authHeaders(req *Request, creds *Credentials) {
 	req.Headers().Set(NewHeader("Authorization", fmt.Sprintf(
 		`Digest username="%s", realm="%s", uri="%s"`,
-		creds.Username, creds.Realm, req.Uri.String())))
+		escapeAuthValue(creds.Username), escapeAuthValue(creds.Realm), escapeAuthValue(req.Uri.String()))))
+}
+
+// escapeAuthValue escapes a value destined for a quoted auth parameter so
+// it cannot break out of the quoting.
+func escapeAuthValue(s string) string {
+	s = strings.ReplaceAll(s, `\`, `\\`)
+	return strings.ReplaceAll(s, `"`, `\"`)
 }
 
 func MD5Hex(parts ...string) string {
@@ -234,15 +267,31 @@ func MD5Hex(parts ...string) string {
 	return fmt.Sprintf("%x", h.Sum(nil))
 }
 
+// digestHashHex hashes s according to the Digest algorithm; falls back to MD5.
+func digestHashHex(algorithm string, parts ...string) string {
+	joined := strings.Join(parts, "")
+	switch strings.ToLower(algorithm) {
+	case "sha-256":
+		sum := sha256.Sum256([]byte(joined))
+		return hex.EncodeToString(sum[:])
+	case "sha-512-256":
+		sum := sha512.Sum512_256([]byte(joined))
+		return hex.EncodeToString(sum[:])
+	default:
+		return MD5Hex(parts...)
+	}
+}
+
 func DigestResponse(challenge *Auth, method Method, uri, username, password string, cnonce, nc string) *Auth {
+	algorithm := strings.ToUpper(challenge.Algorithm)
 	qop := challenge.Qop
-	ha1 := MD5Hex(username + ":" + challenge.Realm + ":" + password)
-	ha2 := MD5Hex(string(method) + ":" + uri)
+	ha1 := digestHashHex(challenge.Algorithm, username+":"+challenge.Realm+":"+password)
+	ha2 := digestHashHex(challenge.Algorithm, string(method)+":"+uri)
 	var resp string
 	if qop == "" {
-		resp = MD5Hex(ha1 + ":" + challenge.Nonce + ":" + ha2)
+		resp = digestHashHex(challenge.Algorithm, ha1+":"+challenge.Nonce+":"+ha2)
 	} else {
-		resp = MD5Hex(ha1 + ":" + challenge.Nonce + ":" + nc + ":" + cnonce + ":" + qop + ":" + ha2)
+		resp = digestHashHex(challenge.Algorithm, ha1+":"+challenge.Nonce+":"+nc+":"+cnonce+":"+qop+":"+ha2)
 	}
 	a := &Auth{
 		Scheme:    "Digest",
@@ -254,7 +303,7 @@ func DigestResponse(challenge *Auth, method Method, uri, username, password stri
 		Qop:       qop,
 		Cnonce:    cnonce,
 		Nc:        nc,
-		Algorithm: challenge.Algorithm,
+		Algorithm: algorithm,
 		Opaque:    challenge.Opaque,
 	}
 	return a

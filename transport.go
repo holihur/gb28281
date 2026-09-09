@@ -47,9 +47,18 @@ type Transport struct {
 	mu          sync.Mutex
 	tcpConns    map[string]net.Conn
 	connLastUse map[string]time.Time
+	inflight    map[string]*dialCall
 	packets     chan *Packet
 	done        chan struct{}
 	closeOnce   sync.Once
+}
+
+// dialCall tracks a single in-flight outbound dial so concurrent Send calls
+// to the same target share one connection instead of dialing in parallel.
+type dialCall struct {
+	wg  sync.WaitGroup
+	c   net.Conn
+	err error
 }
 
 const (
@@ -160,6 +169,7 @@ func NewTransport(host string, udpPort, tcpPort int) (*Transport, error) {
 	t := &Transport{
 		tcpConns:    make(map[string]net.Conn),
 		connLastUse: make(map[string]time.Time),
+		inflight:    make(map[string]*dialCall),
 		packets:     make(chan *Packet, 256),
 		done:        make(chan struct{}),
 	}
@@ -217,6 +227,7 @@ func (t *Transport) readUDP() {
 			case <-t.done:
 				return
 			default:
+				time.Sleep(10 * time.Millisecond)
 				continue
 			}
 		}
@@ -232,6 +243,7 @@ func (t *Transport) acceptStream(l net.Listener, network string) {
 			case <-t.done:
 				return
 			default:
+				time.Sleep(10 * time.Millisecond)
 				continue
 			}
 		}
@@ -307,13 +319,13 @@ func (t *Transport) Send(network string, dst Addr, msg Message) error {
 		if hook := t.dropHook(); hook != nil && hook(msg, dst) {
 			return nil
 		}
-		addr := &net.UDPAddr{IP: net.ParseIP(dst.Host), Port: dst.Port}
+		addr := &net.UDPAddr{IP: pickAddrFamily(t.udpConn, net.ParseIP(dst.Host)), Port: dst.Port}
 		if addr.IP == nil {
 			ips, err := net.LookupIP(dst.Host)
 			if err != nil || len(ips) == 0 {
 				return fmt.Errorf("sip: resolve %s: %w", dst.Host, err)
 			}
-			addr.IP = ips[0]
+			addr.IP = pickAddrFamily(t.udpConn, ips[0])
 		}
 		_ = t.udpConn.SetWriteDeadline(time.Now().Add(writeTimeout))
 		_, err := t.udpConn.WriteToUDP(data, addr)
@@ -332,6 +344,24 @@ func (t *Transport) Send(network string, dst Addr, msg Message) error {
 	}
 }
 
+// pickAddrFamily selects an address matching the local socket family,
+// preferring IPv4 for IPv4-bound connections.
+func pickAddrFamily(conn *net.UDPConn, ip net.IP) net.IP {
+	if conn == nil || ip == nil {
+		return ip
+	}
+	local, ok := conn.LocalAddr().(*net.UDPAddr)
+	if !ok || local.IP == nil {
+		return ip
+	}
+	local4 := local.IP.To4()
+	wants4 := local4 != nil
+	if (wants4 && ip.To4() != nil) || (!wants4 && ip.To4() == nil) {
+		return ip
+	}
+	return nil
+}
+
 func (t *Transport) connKey(c net.Conn) string {
 	network := "tcp"
 	if _, ok := c.(*tls.Conn); ok {
@@ -347,34 +377,60 @@ func (t *Transport) getStreamConn(network string, dst Addr) (net.Conn, error) {
 		t.mu.Unlock()
 		return c, nil
 	}
+	if d, ok := t.inflight[key]; ok {
+		t.mu.Unlock()
+		d.wg.Wait()
+		t.mu.Lock()
+		c, ok := t.tcpConns[key]
+		t.mu.Unlock()
+		if ok {
+			return c, nil
+		}
+		return d.c, d.err
+	}
 	if len(t.tcpConns) >= t.maxTCPConns() {
 		t.mu.Unlock()
 		return nil, fmt.Errorf("%w: too many connections", ErrTransportClosed)
 	}
+	dc := &dialCall{}
+	dc.wg.Add(1)
+	t.inflight[key] = dc
 	t.mu.Unlock()
-	d := net.Dialer{Timeout: 5 * time.Second}
-	var c net.Conn
-	var err error
-	if network == "tls" {
-		cfg := t.tlsCfg.Clone()
-		if cfg.ServerName == "" {
-			cfg.ServerName = dst.Host
+
+	c, err := t.dial(network, dst)
+
+	t.mu.Lock()
+	delete(t.inflight, key)
+	if err == nil && c != nil {
+		t.tcpConns[key] = c
+		if t.connLastUse != nil {
+			t.connLastUse[key] = time.Now()
 		}
-		c, err = tls.DialWithDialer(&d, "tcp", formatHostPort(HostPort{dst.Host, dst.Port}), cfg)
-	} else {
-		c, err = d.Dial("tcp", net.JoinHostPort(dst.Host, strconv.Itoa(dst.Port)))
 	}
+	t.mu.Unlock()
+	dc.c = c
+	dc.err = err
+	dc.wg.Done()
 	if err != nil {
 		return nil, err
 	}
-	t.mu.Lock()
-	t.tcpConns[key] = c
-	if t.connLastUse != nil {
-		t.connLastUse[key] = time.Now()
-	}
-	t.mu.Unlock()
 	go t.readTCP(c)
 	return c, nil
+}
+
+func (t *Transport) dial(network string, dst Addr) (net.Conn, error) {
+	d := net.Dialer{Timeout: 5 * time.Second}
+	if network == "tls" {
+		cfg := t.tlsCfg.Clone()
+		if cfg.MinVersion == 0 {
+			cfg.MinVersion = tls.VersionTLS12
+		}
+		if cfg.ServerName == "" {
+			cfg.ServerName = dst.Host
+		}
+		return tls.DialWithDialer(&d, "tcp", formatHostPort(HostPort{dst.Host, dst.Port}), cfg)
+	}
+	return d.Dial("tcp", net.JoinHostPort(dst.Host, strconv.Itoa(dst.Port)))
 }
 
 func (t *Transport) TLSPort() int {

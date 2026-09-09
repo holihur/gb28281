@@ -29,17 +29,36 @@ type ProxyConfig struct {
 	RecordRoute bool
 	TimerC      time.Duration
 	Logger      Logger
+	// RelayRegister enables forwarding REGISTER requests. Off by default:
+	// without registrar-side authentication the proxy would act as an open
+	// relay and allow registration hijacking.
+	RelayRegister bool
 }
 
 type branchState struct {
+	mu      sync.Mutex
 	ctx     *ClientTx
 	target  *Uri
 	final   *Response
 	isFinal bool
 }
 
+func (bs *branchState) markFinal(resp *Response) {
+	bs.mu.Lock()
+	bs.isFinal = true
+	bs.final = resp
+	bs.mu.Unlock()
+}
+
+func (bs *branchState) finalState() (bool, *Response) {
+	bs.mu.Lock()
+	defer bs.mu.Unlock()
+	return bs.isFinal, bs.final
+}
+
 type proxyDialog struct {
 	callID      string
+	callerAddr  Addr // source address of the calling leg
 	remoteLeg   *Uri // chosen target for in-dialog requests toward the callee
 	routeSet    []*Uri
 	responseTag string
@@ -109,7 +128,7 @@ func (p *Proxy) handleRequest(req *Request, src Addr, stx *ServerTx) {
 	logger := p.cfg.Logger
 	p.cfgMu.RUnlock()
 	if logger != nil {
-		logger.Debugf("proxy <- %s %s", req.Method, req.Uri)
+		logger.Debugf("proxy <- %s %s", req.Method, RedactUri(req.Uri))
 	}
 	switch req.Method {
 	case ACK:
@@ -120,7 +139,10 @@ func (p *Proxy) handleRequest(req *Request, src Addr, stx *ServerTx) {
 		p.handleInDialog(req, stx)
 	case INVITE, SUBSCRIBE, REFER:
 		p.handleInitial(req, stx)
-	case REGISTER, MESSAGE, OPTIONS, INFO, NOTIFY, UPDATE:
+	case REGISTER:
+		p.handleRegister(req, stx)
+	case MESSAGE, OPTIONS, INFO, NOTIFY, UPDATE:
+		p.handleInitial(req, stx)
 		p.handleInitial(req, stx)
 	default:
 		_ = stx.Respond(NewResponse(501, ""))
@@ -146,7 +168,7 @@ func (p *Proxy) prepareBranch(req *Request, target *Uri, newBranch bool) (*Reque
 			Params: NewParams(),
 		}
 		via.SetBranch(NewBranch())
-		out.Headers().Add(via)
+		out.Headers().Prepend(via)
 	}
 	if p.recordRouteEnabled() {
 		rr := (&Address{Uri: &Uri{Scheme: "sip", Host: p.Host, Port: p.Tp.UDPPort(), Params: NewParams().Set("lr", "")}}).String()
@@ -216,7 +238,7 @@ func (p *Proxy) fork(req *Request, stx *ServerTx, targets []*Uri) {
 		}
 		stillPending := false
 		for _, bs := range branches {
-			if !bs.isFinal {
+			if fin, _ := bs.finalState(); !fin {
 				stillPending = true
 				_ = bs.ctx.Cancel()
 			}
@@ -234,8 +256,7 @@ func (p *Proxy) runBranch(groupKey string, bs *branchState, stx *ServerTx) {
 		select {
 		case ev := <-bs.ctx.Events():
 			if ev.Err != nil {
-				bs.isFinal = true
-				bs.final = NewResponse(504, "")
+				bs.markFinal(NewResponse(504, ""))
 				p.checkGroupDone(groupKey, stx)
 				return
 			}
@@ -243,19 +264,17 @@ func (p *Proxy) runBranch(groupKey string, bs *branchState, stx *ServerTx) {
 			if resp.StatusCode < 200 {
 				continue
 			}
-			bs.isFinal = true
-			bs.final = resp
+			bs.markFinal(resp)
 			if resp.StatusCode >= 200 && resp.StatusCode < 300 {
 				p.deliverFinal(groupKey, bs, stx, resp)
 				return
 			}
 			p.checkGroupDone(groupKey, stx)
-			if bs.isFinal {
+			if fin, _ := bs.finalState(); fin {
 				return
 			}
 		case <-deadline:
-			bs.isFinal = true
-			bs.final = NewResponse(504, "")
+			bs.markFinal(NewResponse(504, ""))
 			_ = bs.ctx.Cancel()
 			p.checkGroupDone(groupKey, stx)
 			return
@@ -274,8 +293,10 @@ func (p *Proxy) deliverFinal(groupKey string, winner *branchState, stx *ServerTx
 	branches := append([]*branchState(nil), p.branches[groupKey]...)
 	p.mu.Unlock()
 	for _, bs := range branches {
-		if bs != winner && !bs.isFinal {
-			_ = bs.ctx.Cancel()
+		if bs != winner {
+			if fin, _ := bs.finalState(); !fin {
+				_ = bs.ctx.Cancel()
+			}
 		}
 	}
 
@@ -290,6 +311,7 @@ func (p *Proxy) deliverFinal(groupKey string, winner *branchState, stx *ServerTx
 		p.mu.Lock()
 		p.dialogs[key] = &proxyDialog{
 			callID:      stx.req.CallID(),
+			callerAddr:  stx.src,
 			remoteLeg:   dlgContact,
 			routeSet:    recordRouteSet(resp),
 			responseTag: localTag,
@@ -318,7 +340,7 @@ func (p *Proxy) checkGroupDone(groupKey string, stx *ServerTx) {
 		return
 	}
 	for _, bs := range branches {
-		if !bs.isFinal {
+		if fin, _ := bs.finalState(); !fin {
 			return
 		}
 	}
@@ -349,11 +371,12 @@ func pickBestResponse(branches []*branchState) *Response {
 		return code
 	}
 	for _, bs := range branches {
-		if bs.final == nil {
+		_, finResp := bs.finalState()
+		if finResp == nil {
 			continue
 		}
-		if best == nil || rank(bs.final.StatusCode) > rank(best.StatusCode) {
-			best = bs.final
+		if best == nil || rank(finResp.StatusCode) > rank(best.StatusCode) {
+			best = finResp
 		}
 	}
 	return best
@@ -385,22 +408,60 @@ func (p *Proxy) handleCancel(req *Request, stx *ServerTx) {
 	_ = stx.Respond(NewResponse(200, ""))
 }
 
+func (p *Proxy) handleRegister(req *Request, stx *ServerTx) {
+	if !p.relayRegisterEnabled() {
+		_ = stx.Respond(NewResponse(403, ""))
+		return
+	}
+	p.handleInitial(req, stx)
+}
+
+func (p *Proxy) relayRegisterEnabled() bool {
+	p.cfgMu.RLock()
+	defer p.cfgMu.RUnlock()
+	return p.cfg.RelayRegister
+}
+
+// dialogSourceAllowed verifies that an in-dialog request originates from
+// one of the dialog's known legs, preventing topologically spoofed BYE/ACK.
+func (p *Proxy) dialogSourceAllowed(dlg *proxyDialog, src Addr) bool {
+	if dlg == nil {
+		return false
+	}
+	if dlg.callerAddr.Host != "" && sameHost(src.Host, dlg.callerAddr.Host) {
+		return true
+	}
+	return dlg.remoteLeg != nil && sameHost(src.Host, dlg.remoteLeg.Host)
+}
+
+func (p *Proxy) getDialog(key string) *proxyDialog {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	return p.dialogs[key]
+}
+
 func (p *Proxy) handleAck(req *Request, src Addr) {
-	if dlg, ok := p.dialogs[p.dialogKey(req)]; ok && dlg.remoteLeg != nil {
-		ack, err := p.prepareBranch(req, dlg.remoteLeg, false)
-		if err == nil {
-			_ = p.forwardRaw(ack, dlg.remoteLeg)
-		}
+	dlg := p.getDialog(p.dialogKey(req))
+	if dlg == nil || !p.dialogSourceAllowed(dlg, src) {
+		return
+	}
+	ack, err := p.prepareBranch(req, dlg.remoteLeg, false)
+	if err == nil {
+		_ = p.forwardRaw(ack, dlg.remoteLeg)
 	}
 }
 
 func (p *Proxy) handleInDialog(req *Request, stx *ServerTx) {
-	dlg, ok := p.dialogs[p.dialogKey(req)]
-	if !ok || dlg.remoteLeg == nil {
+	dlg := p.getDialog(p.dialogKey(req))
+	if dlg == nil || dlg.remoteLeg == nil {
 		_ = stx.Respond(NewResponse(481, ""))
 		return
 	}
-	fwd, err := p.prepareBranch(req, dlg.remoteLeg, false)
+	if !p.dialogSourceAllowed(dlg, stx.src) {
+		_ = stx.Respond(NewResponse(403, ""))
+		return
+	}
+	fwd, err := p.prepareBranch(req, dlg.remoteLeg, true)
 	if err == ErrMaxForwards {
 		_ = stx.Respond(NewResponse(483, ""))
 		return

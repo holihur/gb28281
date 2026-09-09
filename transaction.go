@@ -4,8 +4,12 @@ import (
 	"crypto/rand"
 	"encoding/hex"
 	"fmt"
+	"net"
+	"os"
 	"strconv"
+	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 )
 
@@ -184,12 +188,17 @@ func (m *TxManager) Run() {
 	}()
 }
 
+var branchFallbackCounter atomic.Uint64
+
 func NewBranch() string {
 	b := make([]byte, 12)
-	if _, err := rand.Read(b); err != nil {
-		return fmt.Sprintf("z9hG4bK%d", time.Now().UnixNano())
+	if _, err := rand.Read(b); err == nil {
+		return "z9hG4bK" + hex.EncodeToString(b)
 	}
-	return "z9hG4bK" + hex.EncodeToString(b)
+	// CSPRNG failure: mix pid, a process-wide counter and high-resolution
+	// time so branches stay unpredictable rather than timestamp-only.
+	n := branchFallbackCounter.Add(1)
+	return fmt.Sprintf("z9hG4bK%016x%08x%04x", time.Now().UnixNano(), os.Getpid(), n&0xffff)
 }
 
 func serverTxKey(req *Request) string {
@@ -250,6 +259,20 @@ func (m *TxManager) handleRequest(req *Request, src Addr) {
 		}
 		return
 	}
+	if method == CANCEL {
+		// Anti-spoofing (RFC 3261 9.1): a CANCEL must originate from the same
+		// address as the INVITE it cancels. Drop it otherwise.
+		key := "S|" + viaBranch(req) + "|INVITE"
+		m.mu.Lock()
+		stx, ok := m.txs[key].(*ServerTx)
+		m.mu.Unlock()
+		if ok && !sameAddr(src, stx.src) {
+			if onError := m.onErrorFn(); onError != nil {
+				onError(fmt.Errorf("%w: cancel from %s for invite from %s", ErrTxNotFound, src, stx.src), src)
+			}
+			return
+		}
+	}
 	key := serverTxKey(req)
 	m.mu.Lock()
 	stx, ok := m.txs[key].(*ServerTx)
@@ -305,6 +328,28 @@ func viaBranch(req *Request) string {
 		return ""
 	}
 	return via.Branch()
+}
+
+// sameAddr reports whether two source addresses belong to the same
+// host:port endpoint (used for anti-spoofing checks).
+func sameAddr(a, b Addr) bool {
+	if a == b {
+		return true
+	}
+	return a.Port == b.Port && sameHost(a.Host, b.Host)
+}
+
+// sameHost compares two host strings, treating equal IPs as equal.
+func sameHost(a, b string) bool {
+	if strings.EqualFold(a, b) {
+		return true
+	}
+	ia := net.ParseIP(a)
+	ib := net.ParseIP(b)
+	if ia != nil && ib != nil {
+		return ia.Equal(ib)
+	}
+	return false
 }
 
 func clientTxKeyOf(resp *Response) string {
@@ -535,6 +580,9 @@ func (t *ClientTx) deliver(e TxEvent) {
 	select {
 	case t.events <- e:
 	default:
+		if m := t.m; m != nil && m.Metrics != nil {
+			m.Metrics.Inc("tx_events_dropped")
+		}
 	}
 }
 
@@ -651,7 +699,7 @@ func (t *ServerTx) Respond(resp *Response) error {
 		resp.Headers().Set(&CSeq{Seq: cseq.Seq, Method: cseq.Method})
 	}
 	if via := t.req.Via(); via != nil {
-		resp.Headers().Add(via.Clone())
+		resp.Headers().Prepend(via.Clone())
 	}
 	if f := t.req.Headers().Get("From"); f != nil && resp.Headers().Get("From") == nil {
 		resp.Headers().Add(f.Clone())

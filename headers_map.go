@@ -12,6 +12,11 @@ func (h *Headers) Add(hdr Header) {
 	h.list = append(h.list, hdr)
 }
 
+// Prepend inserts a header at the front of the list (e.g. topmost Via).
+func (h *Headers) Prepend(hdr Header) {
+	h.list = append([]Header{hdr}, h.list...)
+}
+
 func (h *Headers) Set(hdr Header) {
 	name := CanonicalName(hdr.Name())
 	for i := range h.list {

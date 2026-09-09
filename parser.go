@@ -9,9 +9,20 @@ import (
 	"strings"
 )
 
+// Message size limits to prevent memory-exhaustion attacks.
+const (
+	MaxMessageSize   = 1 << 20 // 1 MiB: total message cap
+	maxHeaderLines   = 128
+	maxHeaderLineLen = 8192
+	MaxBodySize      = 65536 // 64 KiB body cap
+)
+
 func ParseMessage(data []byte) (Message, error) {
 	if len(data) < 8 {
 		return nil, ErrShortMessage
+	}
+	if len(data) > MaxMessageSize {
+		return nil, fmt.Errorf("%w: message too large: %d bytes", ErrParse, len(data))
 	}
 	reader := bufio.NewReader(bytes.NewReader(data))
 	line, err := reader.ReadString('\n')
@@ -75,14 +86,22 @@ func parseResponse(startLine string, reader *bufio.Reader) (Message, error) {
 func parseHeaderBlock(reader *bufio.Reader, h *Headers, body *[]byte) error {
 	var prev Header
 	contentLength := -1
+	headerCount := 0
 	for {
 		line, err := reader.ReadString('\n')
 		if err != nil && line == "" {
 			return fmt.Errorf("%w: unexpected end of headers: %v", ErrParse, err)
 		}
 		line = strings.TrimRight(line, "\r\n")
+		if len(line) > maxHeaderLineLen {
+			return fmt.Errorf("%w: header line too long", ErrBadHeader)
+		}
 		if line == "" {
 			break
+		}
+		headerCount++
+		if headerCount > maxHeaderLines {
+			return fmt.Errorf("%w: too many headers", ErrBadHeader)
 		}
 		if line[0] == ' ' || line[0] == '\t' {
 			if prev == nil {
@@ -104,6 +123,9 @@ func parseHeaderBlock(reader *bufio.Reader, h *Headers, body *[]byte) error {
 	}
 	if contentLength < 0 {
 		contentLength = 0
+	}
+	if contentLength > MaxBodySize {
+		return fmt.Errorf("%w: content-length %d exceeds limit %d", ErrParse, contentLength, MaxBodySize)
 	}
 	if contentLength > 0 {
 		buf := make([]byte, contentLength)
@@ -173,6 +195,10 @@ type StreamSplitter struct {
 }
 
 func (s *StreamSplitter) Feed(data []byte) ([][]byte, error) {
+	if len(s.buf)+len(data) > MaxMessageSize {
+		s.buf = nil
+		return nil, fmt.Errorf("%w: buffered message exceeds %d bytes", ErrParse, MaxMessageSize)
+	}
 	s.buf = append(s.buf, data...)
 	var out [][]byte
 	for {
@@ -210,6 +236,9 @@ func splitOne(data []byte) (msg, rest []byte, ok bool, err error) {
 		}
 	}
 	total := i + 4 + cl
+	if cl > MaxBodySize {
+		return nil, data, false, fmt.Errorf("%w: content-length %d exceeds limit %d", ErrParse, cl, MaxBodySize)
+	}
 	if len(data) < total {
 		return nil, data, false, nil
 	}

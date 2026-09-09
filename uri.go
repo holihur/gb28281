@@ -125,6 +125,19 @@ func (u *Uri) IsEncrypted() bool {
 	return u != nil && u.Scheme == SchemeSIPS
 }
 
+// RedactUri renders the uri for logging with the password replaced.
+func RedactUri(u *Uri) string {
+	if u == nil || u.Password == "" {
+		if u == nil {
+			return ""
+		}
+		return u.String()
+	}
+	r := u.Clone()
+	r.Password = "***"
+	return r.String()
+}
+
 func (u *Uri) HostPort() string {
 	if u == nil {
 		return ""
