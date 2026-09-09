@@ -345,7 +345,9 @@ func (t *Transport) Send(network string, dst Addr, msg Message) error {
 }
 
 // pickAddrFamily selects an address matching the local socket family,
-// preferring IPv4 for IPv4-bound connections.
+// preferring IPv4 for IPv4-bound connections. For dual-stack (IPv6)
+// sockets a v4 destination is converted to its 4-byte form so the kernel
+// maps it onto the v4 address family instead of dropping it.
 func pickAddrFamily(conn *net.UDPConn, ip net.IP) net.IP {
 	if conn == nil || ip == nil {
 		return ip
@@ -358,6 +360,11 @@ func pickAddrFamily(conn *net.UDPConn, ip net.IP) net.IP {
 	wants4 := local4 != nil
 	if (wants4 && ip.To4() != nil) || (!wants4 && ip.To4() == nil) {
 		return ip
+	}
+	// Dual-stack socket (Go binds "::" with IPV6_V6ONLY=0 by default): a
+	// literal IPv4 destination can still be written using its 4-byte form.
+	if !wants4 && ip.To4() != nil && local.IP.IsUnspecified() {
+		return ip.To4()
 	}
 	return nil
 }

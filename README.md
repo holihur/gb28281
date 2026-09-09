@@ -109,3 +109,45 @@ px.SetResolveTargets(func(req *sip.Request) ([]*sip.Uri, error) {
 b := sip.NewB2BUA(uaIngress, uaEgress, myMediaRelay)
 b.SetRouteTarget(func(req *sip.Request) (*sip.Uri, error) { return dialPlan(req) })
 ```
+
+## GB28181 (GB/T 28181-2016) Signaling
+
+Package `gb28181` implements national-standard signaling on top of this stack:
+
+- **MANSCDP+xml** envelope (Notify / Query / Control / Response) with
+  Keepalive, Catalog, DeviceInfo, DeviceStatus, Alarm, PTZCmd and more
+- **Digest-authenticated REGISTER** (401 challenge flow) on both device and
+  platform sides
+- **Device side** (`gb28181.Device`): registration + keepalive loop, catalog /
+  deviceinfo / status query answers, control command dispatch, streaming
+  INVITE answering with GB28181 SDP
+- **Platform side** (`gb28181.Platform`): device registration with digest
+  verification, keepalive tracking, catalog/deviceinfo queries, PTZ control,
+  alarm collection, live (`Play`) and playback (`PlayBack`) INVITE with
+  `y=` SSRC media description
+- GB28181 SDP build/parse (`y=` SSRC, `s=Play/PlayBack`, `t=` time range)
+
+### Example: platform + device over loopback
+
+```go
+p, _ := gb28181.NewPlatform(gb28181.PlatformConfig{
+    ServerID: "34020000002000000001", ServerHost: "0.0.0.0", ListenPort: 5060,
+    Password: func(deviceID string) (string, bool) { return "12345678", true },
+})
+go p.Run(ctx)
+
+d, _ := gb28181.NewDevice(gb28181.DeviceConfig{
+    DeviceID: "34020000001320000001", Password: "12345678",
+    ServerID: "34020000002000000001", ServerHost: "127.0.0.1", ServerPort: 5060,
+    LocalHost: "127.0.0.1", LocalPort: 5090,
+    Channels: []gb28181.Item{{DeviceID: "34020000001320000002", Name: "cam1"}},
+})
+go d.Start(ctx)
+<-d.Ready()
+
+sess, _ := p.InviteLive("34020000001320000002", "192.168.1.100", 6000, 0x01000001)
+resp, _ := sess.WaitResponse(10 * time.Second) // 200 OK with answer SDP
+_ = sess.Ack()
+```
+
+Package coverage: **>= 90%** (`go test ./gb28181/ -cover`).

@@ -164,3 +164,33 @@ func TestStreamSplitterPartial(t *testing.T) {
 		t.Fatal(err, msgs)
 	}
 }
+
+// Regression: a dual-stack UDP socket (LocalAddr "::") must still deliver
+// datagrams to literal IPv4 destinations; previously pickAddrFamily
+// returned nil and the datagram was silently misrouted.
+func TestSendUDPToLiteralV4FromDualStack(t *testing.T) {
+	raw, err := net.ListenUDP("udp4", &net.UDPAddr{IP: net.ParseIP("127.0.0.1"), Port: 0})
+	if err != nil {
+		t.Skipf("no ipv4 loopback: %v", err)
+	}
+	defer raw.Close()
+	tp, err := NewTransport("0.0.0.0", 0, -1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer tp.Close()
+	msg := NewResponse(200, "")
+	msg.SetBody("text/plain", []byte("ping"))
+	if err := tp.Send("udp", Addr{Network: "udp", Host: "127.0.0.1", Port: raw.LocalAddr().(*net.UDPAddr).Port}, msg); err != nil {
+		t.Fatalf("send: %v", err)
+	}
+	buf := make([]byte, 4096)
+	_ = raw.SetReadDeadline(time.Now().Add(2 * time.Second))
+	n, _, err := raw.ReadFrom(buf)
+	if err != nil {
+		t.Fatalf("datagram not delivered: %v", err)
+	}
+	if !strings.Contains(string(buf[:n]), "ping") {
+		t.Fatalf("unexpected payload: %q", buf[:n])
+	}
+}

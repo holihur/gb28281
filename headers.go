@@ -460,7 +460,7 @@ type Auth struct {
 
 func ParseAuth(s string) (*Auth, error) {
 	s = strings.TrimSpace(s)
-	i := strings.IndexAny(s, " \t")
+	i := strings.IndexAny(s, " \t,")
 	if i < 0 {
 		return &Auth{Scheme: s}, nil
 	}
@@ -513,11 +513,11 @@ func splitAuthParams(s string) []string {
 			escaped = true
 		case c == '"':
 			inQuote = !inQuote
-		case c == ',':
-			if !inQuote {
+		case (c == ',' || c == ' ' || c == '\t') && !inQuote:
+			if i > start {
 				out = append(out, strings.TrimSpace(s[start:i]))
-				start = i + 1
 			}
+			start = i + 1
 		}
 	}
 	out = append(out, strings.TrimSpace(s[start:]))
