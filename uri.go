@@ -27,6 +27,11 @@ func ParseUri(s string) (*Uri, error) {
 	if s == "" {
 		return nil, fmt.Errorf("%w: empty uri", ErrBadUri)
 	}
+	for _, r := range s {
+		if r < 0x20 || r == 0x7f {
+			return nil, fmt.Errorf("%w: control character in uri", ErrBadUri)
+		}
+	}
 	scheme, rest, found := strings.Cut(s, ":")
 	if !found {
 		return nil, fmt.Errorf("%w: missing scheme in %q", ErrBadUri, s)
@@ -42,7 +47,7 @@ func ParseUri(s string) (*Uri, error) {
 	params := ""
 	headers := ""
 	if i := strings.IndexAny(rest, ";?"); i >= 0 {
-		hostPart = rest[:i]
+		hostPart = strings.TrimSpace(rest[:i])
 		rest = rest[i:]
 		if rest[0] == ';' {
 			pi := strings.IndexByte(rest, '?')
@@ -68,6 +73,10 @@ func ParseUri(s string) (*Uri, error) {
 			u.User = userinfo
 		}
 	}
+	if hostPart == "" {
+		return nil, fmt.Errorf("%w: missing host in %q", ErrBadUri, s)
+	}
+	hostPart = strings.TrimSpace(hostPart)
 	if hostPart == "" {
 		return nil, fmt.Errorf("%w: missing host in %q", ErrBadUri, s)
 	}
@@ -99,8 +108,12 @@ func ParseUri(s string) (*Uri, error) {
 	} else {
 		u.Host = host
 	}
+	u.Host = strings.TrimSpace(u.Host)
 	if u.Host == "" {
 		return nil, fmt.Errorf("%w: missing host in %q", ErrBadUri, s)
+	}
+	if strings.Contains(u.Host, ":") && !strings.HasPrefix(u.Host, "[") {
+		return nil, fmt.Errorf("%w: bare colon in host %q", ErrBadUri, s)
 	}
 
 	var err error
@@ -193,37 +206,51 @@ func (u *Uri) paramsEqual(o *Uri) bool {
 	return true
 }
 
+// sanitizeField strips CR/LF/NUL so a malformed Uri can never inject
+// header delimiters into rendered messages (defense in depth).
+func sanitizeField(s string) string {
+	if !strings.ContainsAny(s, "\r\n\x00") {
+		return s
+	}
+	r := strings.NewReplacer("\r", "", "\n", "", "\x00", "")
+	return r.Replace(s)
+}
+
 func (u *Uri) String() string {
 	if u == nil {
 		return ""
 	}
 	var b strings.Builder
-	b.WriteString(u.Scheme)
+	b.WriteString(sanitizeField(u.Scheme))
 	b.WriteByte(':')
 	if u.User != "" {
-		b.WriteString(u.User)
+		b.WriteString(sanitizeField(u.User))
 		if u.Password != "" {
 			b.WriteByte(':')
-			b.WriteString(u.Password)
+			b.WriteString(sanitizeField(u.Password))
 		}
 		b.WriteByte('@')
 	}
-	b.WriteString(u.Host)
+	host := sanitizeField(u.Host)
+	if strings.Contains(host, ":") && !strings.HasPrefix(host, "[") {
+		host = "[" + host + "]"
+	}
+	b.WriteString(host)
 	if u.Port > 0 {
 		b.WriteByte(':')
 		b.WriteString(strconv.Itoa(u.Port))
 	}
-	b.WriteString(u.Params.String())
+	b.WriteString(sanitizeField(u.Params.String()))
 	if u.Headers != nil && u.Headers.Len() > 0 {
 		b.WriteByte('?')
 		for i, it := range u.Headers.Items() {
 			if i > 0 {
 				b.WriteByte('&')
 			}
-			b.WriteString(it.Key)
+			b.WriteString(sanitizeField(it.Key))
 			if it.HasValue {
 				b.WriteByte('=')
-				b.WriteString(it.Value)
+				b.WriteString(sanitizeField(it.Value))
 			}
 		}
 	}

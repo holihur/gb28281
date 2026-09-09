@@ -93,6 +93,9 @@ func parseHeaderBlock(reader *bufio.Reader, h *Headers, body *[]byte) error {
 			return fmt.Errorf("%w: unexpected end of headers: %v", ErrParse, err)
 		}
 		line = strings.TrimRight(line, "\r\n")
+		if strings.ContainsRune(line, '\r') {
+			return fmt.Errorf("%w: bare CR in header line", ErrBadHeader)
+		}
 		if len(line) > maxHeaderLineLen {
 			return fmt.Errorf("%w: header line too long", ErrBadHeader)
 		}

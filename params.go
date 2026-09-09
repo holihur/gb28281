@@ -110,10 +110,11 @@ func (p *Params) Clone() *Params {
 }
 
 func escapeParam(v string) string {
-	if strings.ContainsAny(v, "\";?,") {
-		return `"` + strings.ReplaceAll(v, `"`, `\"`) + `"`
+	if !strings.ContainsAny(v, "\";?,") {
+		return sanitizeField(v)
 	}
-	return v
+	q := strings.ReplaceAll(v, `"`, `\"`)
+	return `"` + sanitizeField(q) + `"`
 }
 
 func (p *Params) String() string {
@@ -123,7 +124,7 @@ func (p *Params) String() string {
 	var b strings.Builder
 	for _, it := range p.items {
 		b.WriteByte(';')
-		b.WriteString(it.Key)
+		b.WriteString(escapeParam(it.Key))
 		if it.HasValue {
 			b.WriteByte('=')
 			b.WriteString(escapeParam(it.Value))
@@ -135,16 +136,19 @@ func (p *Params) String() string {
 func splitParamList(s string) []string {
 	var out []string
 	inQuote := false
+	escaped := false
 	start := 0
 	for i := 0; i < len(s); i++ {
-		switch c := s[i]; c {
-		case '"':
+		switch c := s[i]; {
+		case escaped:
+			escaped = false
+		case c == '\\' && inQuote:
+			escaped = true
+		case c == '"':
 			inQuote = !inQuote
-		case ';':
-			if !inQuote {
-				out = append(out, s[start:i])
-				start = i + 1
-			}
+		case c == ';' && !inQuote:
+			out = append(out, s[start:i])
+			start = i + 1
 		}
 	}
 	out = append(out, s[start:])
@@ -173,6 +177,9 @@ func ParseParams(s string) (*Params, error) {
 		k = strings.TrimSpace(k)
 		if k == "" {
 			return nil, fmt.Errorf("%w: empty param key in %q", ErrParse, s)
+		}
+		if strings.ContainsAny(k, "\";,?<>()@:\\[]") {
+			return nil, fmt.Errorf("%w: invalid characters in param key %q", ErrParse, k)
 		}
 		if found {
 			p.Set(strings.ToLower(k), unquote(strings.TrimSpace(v)))

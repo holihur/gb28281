@@ -100,6 +100,11 @@ type Via struct {
 
 func ParseVia(s string) (*Via, error) {
 	s = strings.TrimSpace(s)
+	for i := 0; i < len(s); i++ {
+		if c := s[i]; c < 0x20 || c == 0x7f {
+			return nil, fmt.Errorf("%w: control character in via", ErrParse)
+		}
+	}
 	parts := strings.SplitN(s, " ", 2)
 	if len(parts) != 2 {
 		return nil, fmt.Errorf("%w: bad via %q", ErrParse, s)
@@ -209,7 +214,7 @@ func ParseAddress(s string) (*Address, error) {
 		a.DisplayName = unquote(raw)
 		a.Quoted = raw != a.DisplayName
 		end := strings.LastIndexByte(s, '>')
-		if end < 0 {
+		if end < 0 || end <= uriStart {
 			return nil, fmt.Errorf("%w: unterminated < in %q", ErrBadAddress, s)
 		}
 		uri := s[uriStart+1 : end]
@@ -356,9 +361,14 @@ func splitAddrList(s string) []string {
 	var out []string
 	depth := 0
 	inQuote := false
+	escaped := false
 	start := 0
 	for i := 0; i < len(s); i++ {
 		switch c := s[i]; {
+		case escaped:
+			escaped = false
+		case c == '\\' && inQuote:
+			escaped = true
 		case c == '"':
 			inQuote = !inQuote
 		case !inQuote && c == '<':
@@ -493,12 +503,17 @@ func ParseAuth(s string) (*Auth, error) {
 func splitAuthParams(s string) []string {
 	var out []string
 	inQuote := false
+	escaped := false
 	start := 0
 	for i := 0; i < len(s); i++ {
-		switch c := s[i]; c {
-		case '"':
+		switch c := s[i]; {
+		case escaped:
+			escaped = false
+		case c == '\\' && inQuote:
+			escaped = true
+		case c == '"':
 			inQuote = !inQuote
-		case ',':
+		case c == ',':
 			if !inQuote {
 				out = append(out, strings.TrimSpace(s[start:i]))
 				start = i + 1
