@@ -151,3 +151,14 @@ _ = sess.Ack()
 ```
 
 Package coverage: **>= 90%** (`go test ./gb28181/ -cover`).
+
+### Python black-box tests (GB28181)
+
+Wire-level tests that treat the Go endpoints purely as black boxes:
+`python` emulates a GB28181 device against `cmd/gb28181serv -mode platform`,
+and a GB28181 platform against `-mode device` (digest auth, keepalives,
+catalog/deviceinfo queries, PTZ control, INVITE/SDP):
+
+```bash
+pytest pytests/gb28181 -v
+```
