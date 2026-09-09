@@ -19,6 +19,7 @@ type DeviceConfig struct {
 	LocalHost         string        // advertised IP for Contact/SDP
 	LocalPort         int           // listening port (5060 or e.g. 5090)
 	KeepaliveInterval time.Duration // default 60s
+	RegisterTimeout   time.Duration // per REGISTER transaction, default 10s
 	Channels          []Item        // channels reported in catalog responses
 	DeviceInfo        DeviceInfoT
 }
@@ -68,6 +69,9 @@ func NewDevice(cfg DeviceConfig) (*Device, error) {
 	if cfg.KeepaliveInterval == 0 {
 		cfg.KeepaliveInterval = 60 * time.Second
 	}
+	if cfg.RegisterTimeout == 0 {
+		cfg.RegisterTimeout = 10 * time.Second
+	}
 	d := &Device{cfg: cfg, streams: make(map[string]*Stream), ready: make(chan struct{})}
 	return d, nil
 }
@@ -86,6 +90,12 @@ func (d *Device) Start(ctx context.Context) error {
 	d.ua.SetCallbacks(sip.UACallbacks{
 		OnMessage: d.onMessage,
 		OnInvite:  d.onInvite,
+		OnBye: func(req *sip.Request, dlg *sip.Dialog, stx *sip.ServerTx) {
+			callID := req.CallID()
+			d.mu.Lock()
+			delete(d.streams, callID)
+			d.mu.Unlock()
+		},
 	})
 	close(d.ready)
 	return d.run(ctx)
@@ -116,27 +126,48 @@ func (d *Device) selfUri() *sip.Uri {
 	return &sip.Uri{Scheme: "sip", User: d.cfg.DeviceID, Host: d.cfg.LocalHost, Port: d.cfg.LocalPort}
 }
 
-// run performs registration (with digest auth) and periodic keepalives
-// until ctx is done.
+// run performs registration (with digest auth, retried with backoff until
+// it succeeds) and periodic keepalives until ctx is done.
 func (d *Device) run(ctx context.Context) error {
-	registered, err := d.register()
-	if err != nil && d.OnError != nil {
-		d.OnError(err)
-	}
-	if registered {
-		d.mu.Lock()
-		d.regOk = true
-		d.mu.Unlock()
-	}
 	tick := time.NewTicker(d.cfg.KeepaliveInterval)
 	defer tick.Stop()
+	registerBackoff := 500 * time.Millisecond
+	registered := false
 	for {
+		if !registered {
+			ok, err := d.register()
+			if ok {
+				registered = true
+				d.mu.Lock()
+				d.regOk = true
+				d.mu.Unlock()
+			} else if err != nil && d.OnError != nil {
+				d.OnError(err)
+			}
+			if !registered {
+				select {
+				case <-ctx.Done():
+					return ctx.Err()
+				case <-time.After(registerBackoff):
+					if registerBackoff < 8*time.Second {
+						registerBackoff *= 2
+					}
+					continue
+				}
+			}
+			registerBackoff = 500 * time.Millisecond
+		}
 		select {
 		case <-ctx.Done():
+			_ = d.tp.Close()
 			return ctx.Err()
 		case <-tick.C:
 			if err := d.Keepalive(); err != nil && d.OnError != nil {
 				d.OnError(err)
+				// platform unreachable: re-register on next tick
+				d.mu.Lock()
+				registered = false
+				d.mu.Unlock()
 			}
 		}
 	}
@@ -164,7 +195,7 @@ func (d *Device) register() (bool, error) {
 				return 0, nil, ev.Err
 			}
 			return ev.Response.StatusCode, ev.Response, nil
-		case <-time.After(10 * time.Second):
+		case <-time.After(d.cfg.RegisterTimeout):
 			return 0, nil, sip.ErrTimeout
 		}
 	}

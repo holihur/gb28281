@@ -93,6 +93,7 @@ func (p *Platform) Run(ctx context.Context) error {
 	})
 	close(p.ready)
 	<-ctx.Done()
+	_ = p.tp.Close()
 	return ctx.Err()
 }
 
@@ -199,11 +200,13 @@ func (p *Platform) onMessage(req *sip.Request, stx *sip.ServerTx) {
 	_ = p.ua.Respond(nil, stx, 200, "", nil)
 	deviceID := req.From().Uri.User
 	d := p.device(deviceID)
+	// Any message from the device refreshes its liveness; keepalives are
+	// tracked explicitly below.
+	p.mu.Lock()
+	d.LastSeen = time.Now()
+	p.mu.Unlock()
 	switch e.CmdType {
 	case CmdKeepalive:
-		p.mu.Lock()
-		d.LastSeen = time.Now()
-		p.mu.Unlock()
 	case CmdCatalog:
 		if e.DeviceList != nil {
 			p.mu.Lock()

@@ -458,3 +458,36 @@ func TestPlatformDevicesSnapshot(t *testing.T) {
 		t.Fatalf("devices snapshot: %+v", devs)
 	}
 }
+
+func TestDeviceReregistersAfterFailure(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	// Server not listening yet: registration fails, device retries.
+	d, _ := NewDevice(DeviceConfig{
+		DeviceID: testDeviceID, Password: "12345678", ServerID: testServerID,
+		ServerHost: "127.0.0.1", ServerPort: 25075, LocalHost: "127.0.0.1", LocalPort: 25076,
+		RegisterTimeout: 100 * time.Millisecond,
+	})
+	errs := make(chan error, 16)
+	d.OnError = func(err error) {
+		select {
+		case errs <- err:
+		default:
+		}
+	}
+	go func() { _ = d.Start(ctx) }()
+	if !waitUntil(t, 5*time.Second, func() bool { return len(errs) > 0 }) {
+		t.Fatal("no errors observed while server down")
+	}
+	if d.Registered() {
+		t.Fatal("must not be registered while server down")
+	}
+	// Bring the platform up; the device must recover.
+	p, _ := NewPlatform(PlatformConfig{ServerID: testServerID, ServerHost: "127.0.0.1", ListenPort: 25075,
+		Password: func(string) (string, bool) { return "12345678", true }})
+	go func() { _ = p.Run(ctx) }()
+	<-p.Ready()
+	if !waitUntil(t, 10*time.Second, func() bool { return d.Registered() && p.IsOnline(testDeviceID) }) {
+		t.Fatal("device did not recover registration")
+	}
+}
